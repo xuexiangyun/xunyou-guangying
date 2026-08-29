@@ -1,0 +1,9 @@
+fastapi>=0.116,<1.0
+uvicorn[standard]>=0.35,<1.0
+python-multipart>=0.0.20
+openai>=1.100,<3.0
+numpy>=1.26,<3.0
+Pillow>=11.0,<13.0
+openai-whisper>=20250625
+pytest>=8.0
+httpx>=0.28

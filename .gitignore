@@ -1,0 +1,38 @@
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+**/.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Local secrets and environment overrides
+.env
+.env.*
+!.env.example
+
+# Runtime data, credentials and generated media
+data/uploads/*
+data/outputs/*
+data/temp/*
+data/config/*
+data/db/*.sqlite3
+data/db/*.sqlite3-*
+!data/uploads/.gitkeep
+!data/outputs/.gitkeep
+!data/temp/.gitkeep
+!data/db/.gitkeep
+
+# Source videos are local-only and may be copyrighted or too large for GitHub
+素材/
