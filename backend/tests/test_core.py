@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import sqlite3
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
 
 from backend.app.database import Database
 from backend.app.services import maintenance, pipeline, qwen
+from backend.app.services import slices as local_slices
 from backend.app.services.qwen import (
     GAME_LABELS,
     GAME_MODE_LABELS,
@@ -22,7 +24,7 @@ from backend.app.services.qwen import (
     qwen_error_message,
     save_credentials,
 )
-from backend.app.schemas import JobCreateRequest, JobOptions
+from backend.app.schemas import JobCreateRequest, JobOptions, LocalSliceRequest
 from backend.app.services.subtitles import create_caption_images
 from backend.app.services.pipeline import (
     SourceVideo,
@@ -32,6 +34,7 @@ from backend.app.services.pipeline import (
     _qualified_candidates,
     _should_generate_subtitles,
     _target_duration,
+    analysis_budget_for,
 )
 from backend.app.services.video import (
     candidate_count_for_duration,
@@ -985,3 +988,155 @@ def test_multi_file_pipeline_produces_cross_file_montage(
     assert output_metadata["width"] == 960
     assert output_metadata["height"] == 540
     assert output_metadata["has_audio"] is True
+
+
+def test_candidate_proxies_survive_until_next_cleanup(tmp_path: Path) -> None:
+    base = tmp_path / "temp"
+    job_dir = base / "job-1"
+    candidate_dir = job_dir / "candidate_00"
+    candidate_dir.mkdir(parents=True)
+    (candidate_dir / "qwen_candidate.mp4").write_bytes(b"proxy")
+    raw_clip = job_dir / "highlight_raw.mp4"
+    raw_clip.write_bytes(b"raw")
+
+    assert maintenance.clear_candidate_dirs(base) == 1
+    assert not candidate_dir.exists()
+    # The job directory and non-candidate files are left for inspection.
+    assert job_dir.is_dir()
+    assert raw_clip.exists()
+    assert maintenance.clear_candidate_dirs(tmp_path / "missing") == 0
+
+
+def test_local_slice_request_shares_upload_selection_rules() -> None:
+    assert LocalSliceRequest(upload_id="u1").resolved_upload_ids() == ["u1"]
+    assert LocalSliceRequest(upload_ids=["a", "a", "b"]).resolved_upload_ids() == ["a", "b"]
+    with pytest.raises(ValueError):
+        LocalSliceRequest().resolved_upload_ids()
+
+
+def test_analysis_budget_matches_job_and_slice_paths() -> None:
+    assert analysis_budget_for(30.0, "balanced", 1) == 12
+    assert analysis_budget_for(60.0, "balanced", 1) == 12
+    assert analysis_budget_for(90.0, "balanced", 1) == 16
+    assert analysis_budget_for(120.0, "balanced", 1) == 20
+    assert analysis_budget_for(60.0, "broad", 1) == 14
+    assert analysis_budget_for(60.0, "balanced", 3) == 16
+
+
+def test_slice_task_renders_exactly_the_qwen_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(local_slices, "TEMP_DIR", tmp_path / "temp")
+    monkeypatch.setattr(
+        local_slices,
+        "rank_local_candidates",
+        lambda path, duration, sensitivity, callback=None, token=None: [
+            {"center": float(index * 25 + 20), "local_score": round(1 - index * 0.02, 4)}
+            for index in range(20)
+        ],
+    )
+
+    def fake_render(source, output, start, duration, token=None):
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"proxy")
+        return output
+
+    monkeypatch.setattr(local_slices, "render_analysis_proxy", fake_render)
+
+    metadata = {"duration": 600.0, "width": 1920, "height": 1080, "has_audio": True}
+    source = SourceVideo(path=tmp_path / "a.mp4", metadata=metadata)
+    manager = local_slices.LocalSliceManager()
+    task_id = manager.submit([source], sensitivity="balanced", duration_mode="seconds_30")
+
+    deadline = time.time() + 30
+    task = manager.status(task_id)
+    while task and task["state"] in {"queued", "running"} and time.time() < deadline:
+        time.sleep(0.05)
+        task = manager.status(task_id)
+
+    assert task and task["state"] == "completed", task
+    # 20 local candidates are trimmed to the same 12-slot budget a real job uses.
+    assert len(task["slices"]) == analysis_budget_for(30.0, "balanced", 1) == 12
+    assert all(item["filename"].startswith("candidate_") for item in task["slices"])
+
+
+def test_orphan_uploads_are_removed_but_active_ones_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    uploads_dir = tmp_path / "uploads"
+    uploads_dir.mkdir()
+    monkeypatch.setattr(maintenance, "UPLOAD_DIR", uploads_dir)
+    monkeypatch.setattr(maintenance, "OUTPUT_DIR", tmp_path / "outputs")
+    monkeypatch.setattr(maintenance, "TEMP_DIR", tmp_path / "temp")
+
+    database = Database(tmp_path / "db.sqlite3")
+    for upload_id in ("u1", "u2", "u3"):
+        path = uploads_dir / f"{upload_id}.mp4"
+        path.write_bytes(b"x")
+        database.create_upload(upload_id, f"{upload_id}.mp4", path, 1, "video/mp4")
+        database.update_upload(upload_id, state="ready", received_bytes=1)
+    database.create_job("job", "u1", {"game": "auto", "sensitivity": "balanced"}, upload_ids=["u1"])
+    # u3 is an upload still in progress and must survive.
+    database.update_upload("u3", state="uploading")
+
+    assert maintenance.discard_orphan_uploads(database) == 1
+    assert database.get_upload("u1") is not None
+    assert database.get_upload("u2") is None
+    assert database.get_upload("u3") is not None
+    assert (uploads_dir / "u1.mp4").exists()
+    assert not (uploads_dir / "u2.mp4").exists()
+    assert (uploads_dir / "u3.mp4").exists()
+
+    # An upload held by a running local-slice task is protected too.
+    path = uploads_dir / "u4.mp4"
+    path.write_bytes(b"x")
+    database.create_upload("u4", "u4.mp4", path, 1, "video/mp4")
+    database.update_upload("u4", state="ready", received_bytes=1)
+    assert maintenance.discard_orphan_uploads(database, keep_upload_ids={"u4"}) == 0
+    assert database.get_upload("u4") is not None
+
+
+@pytest.mark.integration
+def test_local_slice_manager_writes_candidate_clips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(local_slices, "TEMP_DIR", tmp_path / "temp")
+    video = tmp_path / "match.mp4"
+    subprocess.run(
+        [
+            settings.ffmpeg,
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=640x360:rate=15:duration=8",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            str(video),
+        ],
+        check=True,
+    )
+    metadata = probe_video(video)
+
+    manager = local_slices.LocalSliceManager()
+    task_id = manager.submit([SourceVideo(path=video, metadata=metadata)])
+
+    deadline = time.time() + 120
+    task = manager.status(task_id)
+    while task and task["state"] in {"queued", "running"} and time.time() < deadline:
+        time.sleep(0.2)
+        task = manager.status(task_id)
+
+    assert task and task["state"] == "completed", task
+    assert task["slices"], task
+    for item in task["slices"]:
+        assert Path(item["path"]).exists()
+        assert item["source"] == "match.mp4"
+        assert item["duration"] > 0
+    assert (Path(task["directory"]) / "slices.json").exists()

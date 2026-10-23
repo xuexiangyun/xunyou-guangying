@@ -253,6 +253,9 @@ main { width: min(1180px, calc(100% - 36px)); margin: 0 auto; padding-bottom: 80
 .primary-button { width: 100%; border: 0; background: var(--green); color: #0b1308; min-height: 53px; border-radius: 11px; font-weight: 800; cursor: pointer; display: flex; justify-content: center; align-items: center; gap: 16px; transition: .2s; box-shadow: 0 12px 35px rgba(173,255,47,.12); }
 .primary-button:hover:not(:disabled) { transform: translateY(-2px); box-shadow: 0 15px 38px rgba(173,255,47,.2); }
 .primary-button:disabled { opacity: .35; cursor: not-allowed; box-shadow: none; }
+.secondary-button { width: 100%; margin-top: 10px; min-height: 45px; border: 1px solid var(--line); border-radius: 11px; background: transparent; color: var(--muted); font-size: 13px; font-weight: 600; cursor: pointer; transition: .2s; }
+.secondary-button:hover:not(:disabled) { border-color: var(--green); color: var(--green); }
+.secondary-button:disabled { opacity: .35; cursor: not-allowed; }
 
 .progress-panel { margin-top: 18px; padding: 27px clamp(22px, 4vw, 40px); }
 .progress-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 15px; }
@@ -263,6 +266,12 @@ main { width: min(1180px, calc(100% - 36px)); margin: 0 auto; padding-bottom: 80
 @keyframes pulse { 50% { box-shadow: 0 0 0 10px rgba(173,255,47,0); } }
 .progress-track { height: 6px; border-radius: 99px; background: #1b2529; overflow: hidden; }
 .progress-track i { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--green-2), var(--green)); transition: width .5s ease; }
+.slice-panel { margin-top: 18px; padding: 24px clamp(22px, 4vw, 40px) 26px; }
+.slice-dir { display: block; margin: 0 0 12px; color: var(--muted); font: 11px/1.5 ui-monospace, monospace; word-break: break-all; }
+.slice-list { display: flex; flex-direction: column; gap: 7px; max-height: 320px; overflow-y: auto; }
+.slice-row { display: flex; flex-direction: column; gap: 3px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 10px; background: #050708; }
+.slice-row strong { font-size: 12px; }
+.slice-row span { font: 11px/1.4 ui-monospace, monospace; color: var(--muted); }
 .stage-row { display: grid; grid-template-columns: repeat(7, 1fr); gap: 5px; margin-top: 22px; }
 .stage-row div { display: flex; flex-direction: column; align-items: center; gap: 7px; color: #536269; }
 .stage-row div span { width: 23px; height: 23px; border-radius: 50%; border: 1px solid #35444a; display: grid; place-items: center; font: 9px/1 ui-monospace, monospace; background: #0a0f11; }

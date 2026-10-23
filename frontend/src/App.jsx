@@ -49,7 +49,33 @@ const GAME_MODES = [
   ["campaign", "单人战役"],
 ];
 
+const DURATIONS = [
+  ["seconds_30", "30秒"],
+  ["seconds_60", "60秒"],
+  ["seconds_90", "90秒"],
+  ["seconds_120", "2分钟"],
+];
+
+const SENSITIVITIES = [
+  ["strict", "严格"],
+  ["balanced", "均衡"],
+  ["broad", "宽松"],
+];
+
+const SUBTITLE_MODES = [
+  ["smart", "智能"],
+  ["off", "关闭"],
+  ["always", "始终开启"],
+];
+
+const SUBTITLE_STYLES = [
+  ["gaming", "游戏高亮"],
+  ["minimal", "极简"],
+  ["neon", "霓虹"],
+];
+
 const HIGHLIGHT_LABELS = Object.fromEntries(HIGHLIGHTS);
+const HIGHLIGHT_KEYS = HIGHLIGHTS.map(([key]) => key);
 const GAME_LABELS = Object.fromEntries(GAMES);
 const RAINBOW_SIX_EVENT_LABELS = {
   ace: "ACE",
@@ -106,6 +132,45 @@ async function fetchJson(url, options = {}) {
   }
   if (response.status === 204) return null;
   return response.json();
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function pickOption(options, fallback) {
+  const allowed = new Set(options.map(([key]) => key));
+  return (value) => (allowed.has(value) ? value : fallback);
+}
+
+function pickHighlights(allKeys) {
+  const allowed = new Set(allKeys);
+  return (value) => {
+    if (!Array.isArray(value)) return allKeys;
+    const filtered = value.filter((item) => allowed.has(item));
+    return filtered.length ? filtered : allKeys;
+  };
+}
+
+function usePersistedState(key, fallback, sanitize) {
+  const [value, setValue] = useState(() => {
+    try {
+      const raw = window.localStorage.getItem(key);
+      if (raw === null) return fallback;
+      const parsed = JSON.parse(raw);
+      return sanitize ? sanitize(parsed) : parsed;
+    } catch {
+      return fallback;
+    }
+  });
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(key, JSON.stringify(value));
+    } catch {
+      // Storage can be unavailable in private mode; keeping defaults is fine.
+    }
+  }, [key, value]);
+  return [value, setValue];
 }
 
 function formatBytes(bytes) {
@@ -209,19 +274,25 @@ function App() {
   const [qwenConfigured, setQwenConfigured] = useState(false);
   const [qwenStatusLoading, setQwenStatusLoading] = useState(true);
   const [showQwenSetup, setShowQwenSetup] = useState(false);
-  const [game, setGame] = useState("auto");
-  const [gameMode, setGameMode] = useState("auto");
-  const [highlightTypes, setHighlightTypes] = useState(HIGHLIGHTS.map(([key]) => key));
-  const [durationMode, setDurationMode] = useState("seconds_60");
-  const [subtitleMode, setSubtitleMode] = useState("smart");
-  const [subtitleStyle, setSubtitleStyle] = useState("gaming");
-  const [sensitivity, setSensitivity] = useState("balanced");
+  const [game, setGame] = usePersistedState("xunyou_option_game", "auto", pickOption(GAMES, "auto"));
+  const [gameMode, setGameMode] = usePersistedState("xunyou_option_game_mode", "auto", pickOption(GAME_MODES, "auto"));
+  const [highlightTypes, setHighlightTypes] = usePersistedState(
+    "xunyou_option_highlights",
+    HIGHLIGHT_KEYS,
+    pickHighlights(HIGHLIGHT_KEYS),
+  );
+  const [durationMode, setDurationMode] = usePersistedState("xunyou_option_duration", "seconds_60", pickOption(DURATIONS, "seconds_60"));
+  const [subtitleMode, setSubtitleMode] = usePersistedState("xunyou_option_subtitle_mode", "smart", pickOption(SUBTITLE_MODES, "smart"));
+  const [subtitleStyle, setSubtitleStyle] = usePersistedState("xunyou_option_subtitle_style", "gaming", pickOption(SUBTITLE_STYLES, "gaming"));
+  const [sensitivity, setSensitivity] = usePersistedState("xunyou_option_sensitivity", "balanced", pickOption(SENSITIVITIES, "balanced"));
   const [busy, setBusy] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [job, setJob] = useState(null);
   const [history, setHistory] = useState([]);
   const [error, setError] = useState("");
   const [dragging, setDragging] = useState(false);
+  const [sliceTask, setSliceTask] = useState(null);
+  const [sliceBusy, setSliceBusy] = useState(false);
 
   async function refreshHistory() {
     try {
@@ -462,6 +533,46 @@ function App() {
     }
   }
 
+  async function startLocalSlices() {
+    if (!files.length || busy || sliceBusy) return;
+    setSliceBusy(true);
+    setSliceTask(null);
+    setError("");
+    setUploadProgress(0);
+    const totalBytes = files.reduce((sum, item) => sum + item.file.size, 0) || 1;
+    const uploadIds = [];
+    try {
+      let sentBytes = 0;
+      for (let index = 0; index < files.length; index += 1) {
+        const item = files[index];
+        setUploadLabel(`正在上传 ${index + 1}/${files.length}：${item.file.name}`);
+        const upload = await uploadInChunks(item.file, (fraction) => {
+          setUploadProgress((sentBytes + fraction * item.file.size) / totalBytes);
+        });
+        sentBytes += item.file.size;
+        uploadIds.push(upload.upload_id);
+      }
+      setUploadLabel("正在生成本地切片…");
+      let current = await fetchJson("/api/local-slices", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ upload_ids: uploadIds, sensitivity, duration_mode: durationMode }),
+      });
+      setSliceTask(current);
+      while (current.state === "queued" || current.state === "running") {
+        await sleep(800);
+        current = await fetchJson(`/api/local-slices/${current.task_id}`);
+        setSliceTask(current);
+      }
+      if (current.state === "failed") setError(current.error || "生成本地切片失败。");
+    } catch (sliceError) {
+      setError(sliceError.message);
+    } finally {
+      setUploadLabel("");
+      setSliceBusy(false);
+    }
+  }
+
   async function resetAll() {
     if (job?.job_id && ["completed", "failed", "cancelled"].includes(job.state)) {
       await fetchJson(`/api/jobs/${job.job_id}`, { method: "DELETE" }).catch(() => null);
@@ -619,14 +730,14 @@ function App() {
               </div>
             </div>
 
-            <ToggleGroup label="成片时长" value={durationMode} onChange={setDurationMode} options={[["seconds_30", "30秒"], ["seconds_60", "60秒"], ["seconds_90", "90秒"], ["seconds_120", "2分钟"]]} />
+            <ToggleGroup label="成片时长" value={durationMode} onChange={setDurationMode} options={DURATIONS} />
             <div className="duration-note">这是最长时长：只保留证据完整的高光，不会用跑图、回放或结算画面强行填满。</div>
-            <ToggleGroup label="识别强度" value={sensitivity} onChange={setSensitivity} options={[["strict", "严格"], ["balanced", "均衡"], ["broad", "宽松"]]} />
+            <ToggleGroup label="识别强度" value={sensitivity} onChange={setSensitivity} options={SENSITIVITIES} />
             <div className="duration-note">严格需要至少70分和高置信度；均衡为60分；宽松为50分。三种模式都会先广泛搜索候选。</div>
 
-            <ToggleGroup label="字幕模式" value={subtitleMode} onChange={setSubtitleMode} options={[["smart", "智能"], ["off", "关闭"], ["always", "始终开启"]]} />
+            <ToggleGroup label="字幕模式" value={subtitleMode} onChange={setSubtitleMode} options={SUBTITLE_MODES} />
             <div className="duration-note subtitle-note">智能模式只为语音反应、交流和对话有价值的高光生成字幕，纯操作成片会自动跳过。</div>
-            {subtitleMode !== "off" && <ToggleGroup label="字幕样式" value={subtitleStyle} onChange={setSubtitleStyle} options={[["gaming", "游戏高亮"], ["minimal", "极简"], ["neon", "霓虹"]]} />}
+            {subtitleMode !== "off" && <ToggleGroup label="字幕样式" value={subtitleStyle} onChange={setSubtitleStyle} options={SUBTITLE_STYLES} />}
 
             <div className={`ai-status-row ${qwenConfigured ? "connected" : "missing"}`}>
               <div><span /> <strong>{qwenStatusLoading ? "正在检查千问…" : qwenConfigured ? "千问AI已连接" : "千问尚未配置"}</strong></div>
@@ -667,6 +778,15 @@ function App() {
             >
               {busy ? "正在处理中…" : "开始生成高光成片"}<span>→</span>
             </button>
+            <button
+              type="button"
+              className="secondary-button"
+              disabled={!files.length || busy || sliceBusy}
+              onClick={startLocalSlices}
+              data-testid="local-slice-button"
+            >
+              {sliceBusy ? "正在生成本地切片…" : "生成本地切片"}
+            </button>
           </section>
         </div>
 
@@ -677,6 +797,32 @@ function App() {
             <div className="stage-row">
               {STAGES.map(([key, label], index) => <div key={key} className={index <= currentStageIndex ? "reached" : ""}><span>{index < currentStageIndex || job?.state === "completed" ? "✓" : index + 1}</span><small>{label}</small></div>)}
             </div>
+          </section>
+        )}
+
+        {sliceTask && (
+          <section className="panel slice-panel" data-testid="slice-panel">
+            <div className="progress-header">
+              <div><span className="pulse" /><strong>{sliceTask.message}</strong></div>
+              <div className="progress-actions"><b>{Math.min(100, Math.round((sliceTask.progress || 0) * 100))}%</b></div>
+            </div>
+            {sliceTask.state !== "completed" && (
+              <div className="progress-track"><i style={{ width: `${Math.max(2, (sliceTask.progress || 0) * 100)}%` }} /></div>
+            )}
+            {sliceTask.state === "completed" && (
+              <>
+                <small className="slice-dir">切片保存在：{sliceTask.directory}</small>
+                <div className="slice-list">
+                  {sliceTask.slices.map((item) => (
+                    <div className="slice-row" key={item.filename}>
+                      <strong>{item.filename}</strong>
+                      <span>{item.source} · 第 {Math.round(item.start)} 秒起 · {Math.round(item.duration)} 秒 · 本地分 {item.local_score}</span>
+                    </div>
+                  ))}
+                  {!sliceTask.slices.length && <span>没有找到候选片段。</span>}
+                </div>
+              </>
+            )}
           </section>
         )}
 

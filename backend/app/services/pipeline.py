@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import math
-import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +10,7 @@ from typing import Callable
 from ..database import Database
 from ..settings import OUTPUT_DIR, TEMP_DIR, settings
 from .cancellation import CancellationError, CancellationToken
+from .maintenance import clear_candidate_dirs
 from .qwen import analyze_candidate, is_authentication_error, qwen_error_message, verify_candidate
 from .subtitles import transcribe_and_burn
 from .video import candidate_window, rank_local_candidates, render_analysis_proxy, render_montage
@@ -169,6 +169,25 @@ def _file_duration(item: dict, file_durations: list[float] | float) -> float:
     return float(file_durations[0]) if file_durations else 0.0
 
 
+def analysis_budget_for(
+    target_duration: float,
+    sensitivity: str,
+    file_count: int,
+) -> int:
+    """How many local candidates reach Qwen for one job.
+
+    Shared with the local-slice preview so the clips it renders are exactly the
+    ones a real job would analyse.
+    """
+    desired_segments = max(1, math.ceil(target_duration / 12.0))
+    budget = max(12, desired_segments * 2)
+    if sensitivity == "broad":
+        budget += 2
+    # Extra slots per additional file keep every recording represented.
+    budget += 2 * (max(1, file_count) - 1)
+    return budget
+
+
 def _apply_analysis_budget(candidates: list[dict], budget: int) -> list[dict]:
     """Trim candidates to the Qwen analysis budget, fairly across files.
 
@@ -278,6 +297,9 @@ def run_pipeline(
 ) -> None:
     work_dir = TEMP_DIR / job_id
     output_dir = OUTPUT_DIR / job_id
+    # Earlier runs' candidate proxies stay in temp for inspection until the
+    # next job starts; a retry also drops its own leftovers.
+    clear_candidate_dirs(TEMP_DIR)
     work_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     file_count = len(sources)
@@ -334,12 +356,11 @@ def run_pipeline(
 
         target_duration = _target_duration(str(options["duration_mode"]), total_duration)
         if qwen_api_key:
-            desired_segments = max(1, math.ceil(target_duration / 12.0))
-            analysis_budget = max(12, desired_segments * 2)
-            if str(options.get("sensitivity")) == "broad":
-                analysis_budget += 2
-            # Extra slots per additional file keep every recording represented.
-            analysis_budget += 2 * (file_count - 1)
+            analysis_budget = analysis_budget_for(
+                target_duration,
+                str(options.get("sensitivity")),
+                file_count,
+            )
             candidates = _apply_analysis_budget(candidates, analysis_budget)
         update("candidate_video", 0.35, f"找到 {len(candidates)} 个候选高光")
 
@@ -597,7 +618,3 @@ def run_pipeline(
             message="剪辑失败",
             error=str(exc),
         )
-    finally:
-        for child in work_dir.glob("candidate_*"):
-            if child.is_dir():
-                shutil.rmtree(child, ignore_errors=True)

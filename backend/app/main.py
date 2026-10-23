@@ -16,14 +16,22 @@ from .schemas import (
     CostEstimate,
     JobCreateRequest,
     JobStatus,
+    LocalSliceRequest,
+    LocalSliceStatus,
     QwenCredentialRequest,
     UploadInitRequest,
     UploadInitResponse,
     UploadStatus,
 )
-from .services.maintenance import cleanup_storage, repair_stored_paths
+from .services.maintenance import (
+    clear_candidate_dirs,
+    cleanup_storage,
+    discard_orphan_uploads,
+    repair_stored_paths,
+)
 from .services.pipeline import SourceVideo
 from .services.qwen import load_credentials, qwen_error_message, save_credentials, validate_api_key
+from .services.slices import LocalSliceManager
 from .services.video import VideoValidationError, estimate_cost, probe_video
 from .settings import FRONTEND_DIST, OUTPUT_DIR, TEMP_DIR, UPLOAD_DIR, ensure_directories, settings
 
@@ -31,8 +39,10 @@ from .settings import FRONTEND_DIST, OUTPUT_DIR, TEMP_DIR, UPLOAD_DIR, ensure_di
 ensure_directories()
 app = FastAPI(title=settings.app_name, version="0.1.0")
 jobs = JobManager(db)
+slice_tasks = LocalSliceManager()
 repair_stored_paths(db)
 cleanup_storage(db)
+clear_candidate_dirs(TEMP_DIR)
 
 
 def _require_qwen_credentials() -> tuple[str, str]:
@@ -43,6 +53,29 @@ def _require_qwen_credentials() -> tuple[str, str]:
     if not credentials:
         raise HTTPException(400, "千问尚未配置，请先完成一次Qwen3-Omni-Flash设置。")
     return credentials
+
+
+def _discard_slice_uploads(upload_ids: list[str]) -> None:
+    """Drop the throwaway uploads a local-slice run created.
+
+    Uploads still referenced by a job are kept so retry keeps working.
+    """
+    referenced: set[str] = set()
+    for job in db.list_jobs(1000):
+        referenced.update(_job_upload_ids(job))
+    for upload_id in upload_ids:
+        if upload_id in referenced:
+            continue
+        upload = db.get_upload(upload_id)
+        if upload:
+            Path(upload["stored_path"]).unlink(missing_ok=True)
+            db.delete_upload(upload_id)
+
+
+def _local_slice_status(task: dict | None) -> LocalSliceStatus:
+    if task is None:
+        raise HTTPException(404, "切片任务不存在，服务重启后需要重新生成。")
+    return LocalSliceStatus(**task)
 
 
 def _upload_status(record: dict) -> UploadStatus:
@@ -356,7 +389,7 @@ def cancel_job(job_id: str) -> JobStatus:
 
 @app.post("/api/maintenance/cleanup")
 def maintenance_cleanup() -> dict:
-    return cleanup_storage(db)
+    return cleanup_storage(db, keep_upload_ids=slice_tasks.active_upload_ids())
 
 
 @app.get("/api/jobs/{job_id}", response_model=JobStatus)
@@ -406,6 +439,53 @@ def delete_job(job_id: str, delete_source: bool = True) -> None:
             if upload:
                 Path(upload["stored_path"]).unlink(missing_ok=True)
                 db.delete_upload(upload_id)
+        # Cleaning one job should not leave duplicate or abandoned uploads behind.
+        discard_orphan_uploads(db, keep_upload_ids=slice_tasks.active_upload_ids())
+
+
+@app.post(
+    "/api/local-slices",
+    response_model=LocalSliceStatus,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def create_local_slices(payload: LocalSliceRequest) -> LocalSliceStatus:
+    """Render the local candidate windows only; no Qwen call and no job record."""
+    try:
+        upload_ids = payload.resolved_upload_ids()
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    uploads: list[dict] = []
+    for upload_id in upload_ids:
+        upload = db.get_upload(upload_id)
+        if not upload:
+            raise HTTPException(404, "上传文件不存在，请重新选择视频。")
+        if upload["state"] != "ready" or not upload.get("metadata"):
+            raise HTTPException(409, f"文件「{upload['filename']}」还没有完成上传和校验。")
+        uploads.append(upload)
+    active = [job for job in db.list_jobs(20) if job["state"] in {"queued", "running"}]
+    if active:
+        raise HTTPException(409, "当前已有剪辑任务正在运行，请等待它完成。")
+
+    task_id = slice_tasks.submit(
+        [
+            SourceVideo(
+                path=Path(upload["stored_path"]),
+                metadata=upload["metadata"],
+                filename=upload["filename"],
+            )
+            for upload in uploads
+        ],
+        upload_ids=upload_ids,
+        sensitivity=payload.sensitivity.value,
+        duration_mode=payload.duration_mode.value,
+        cleanup=lambda: _discard_slice_uploads(upload_ids),
+    )
+    return _local_slice_status(slice_tasks.status(task_id))
+
+
+@app.get("/api/local-slices/{task_id}", response_model=LocalSliceStatus)
+def get_local_slices(task_id: str) -> LocalSliceStatus:
+    return _local_slice_status(slice_tasks.status(task_id))
 
 
 if FRONTEND_DIST.exists():

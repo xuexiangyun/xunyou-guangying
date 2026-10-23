@@ -154,10 +154,9 @@ class JobOptions(BaseModel):
         return normalized
 
 
-class JobCreateRequest(BaseModel):
+class UploadSelection(BaseModel):
     upload_id: str | None = None  # Legacy single-file field kept for older clients.
     upload_ids: list[str] = Field(default_factory=list)
-    options: JobOptions = Field(default_factory=JobOptions)
 
     @field_validator("upload_ids")
     @classmethod
@@ -174,6 +173,15 @@ class JobCreateRequest(BaseModel):
         if len(ids) > MAX_JOB_FILES:
             raise ValueError(f"一次最多支持{MAX_JOB_FILES}个录像文件。")
         return ids
+
+
+class JobCreateRequest(UploadSelection):
+    options: JobOptions = Field(default_factory=JobOptions)
+
+
+class LocalSliceRequest(UploadSelection):
+    sensitivity: Sensitivity = Sensitivity.BALANCED
+    duration_mode: DurationMode = DurationMode.SECONDS_60
 
 
 class QwenCredentialRequest(BaseModel):
@@ -210,3 +218,23 @@ class CostEstimate(BaseModel):
     estimated_cny_high: float
     free_tier_may_be_zero: bool = True
     model: str
+
+
+class LocalSliceFile(BaseModel):
+    filename: str
+    source: str
+    file_index: int
+    start: float
+    duration: float
+    local_score: float
+    path: str
+
+
+class LocalSliceStatus(BaseModel):
+    task_id: str
+    state: Literal["queued", "running", "completed", "failed"]
+    progress: float
+    message: str
+    directory: str
+    slices: list[LocalSliceFile] = Field(default_factory=list)
+    error: str | None = None
