@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 
 from .database import Database
 from .services.cancellation import CancellationToken
-from .services.pipeline import run_pipeline
+from .services.pipeline import SourceVideo, run_pipeline
 
 
 class JobManager:
@@ -32,8 +31,7 @@ class JobManager:
         self,
         *,
         job_id: str,
-        source: Path,
-        metadata: dict,
+        sources: list[SourceVideo],
         options: dict,
         qwen_api_key: str,
         qwen_api_host: str,
@@ -45,8 +43,7 @@ class JobManager:
             run_pipeline,
             database=self.database,
             job_id=job_id,
-            source=source,
-            metadata=metadata,
+            sources=sources,
             options=options,
             qwen_api_key=qwen_api_key,
             qwen_api_host=qwen_api_host,

@@ -179,6 +179,14 @@ main { width: min(1180px, calc(100% - 36px)); margin: 0 auto; padding-bottom: 80
 .file-row strong { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-row span { font: 11px/1.4 ui-monospace, monospace; color: var(--muted); }
 .text-button { background: transparent; border: 0; color: var(--green); cursor: pointer; font-size: 12px; }
+.file-list { display: flex; flex-direction: column; gap: 10px; }
+.file-item { display: flex; align-items: center; gap: 13px; border: 1px solid var(--line); border-radius: 13px; padding: 10px 13px; background: #050708; }
+.file-item video { width: 128px; aspect-ratio: 16/9; border: 1px solid var(--line); border-radius: 8px; background: #020303; object-fit: contain; flex-shrink: 0; }
+.file-item .file-info { display: flex; flex-direction: column; min-width: 0; flex: 1; gap: 5px; }
+.file-item .file-info strong { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-item .file-info span { font: 11px/1.4 ui-monospace, monospace; color: var(--muted); }
+.file-list-footer { display: flex; align-items: center; gap: 18px; }
+.file-list-footer small { margin-left: auto; color: var(--muted); font: 11px/1.4 ui-monospace, monospace; }
 
 .api-card { margin-top: 17px; padding: 17px; border: 1px solid var(--line); border-radius: 14px; background: rgba(0,0,0,.15); }
 .api-title { display: flex; align-items: center; gap: 11px; margin-bottom: 13px; }
@@ -329,6 +337,7 @@ footer { max-width: 1180px; width: calc(100% - 36px); margin: 0 auto; padding: 2
   .context-grid { grid-template-columns: 1fr; }
   .upload-panel, .settings-panel { padding: 19px; }
   .dropzone { min-height: 235px; }
+  .file-item video { width: 96px; }
   .stage-row div small { display: none; }
   footer { flex-direction: column; gap: 7px; }
 }

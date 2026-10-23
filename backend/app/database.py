@@ -54,6 +54,8 @@ class Database:
                     message TEXT NOT NULL,
                     options_json TEXT NOT NULL,
                     metadata_json TEXT,
+                    upload_ids_json TEXT,
+                    files_metadata_json TEXT,
                     result_json TEXT,
                     error TEXT,
                     created_at TEXT NOT NULL,
@@ -64,13 +66,24 @@ class Database:
             current_version = connection.execute("PRAGMA user_version").fetchone()[0]
             if current_version < 1:
                 connection.execute("PRAGMA user_version = 1")
+            if current_version < 2:
+                # Multi-file jobs: upload_ids_json stores every source upload,
+                # files_metadata_json stores each file's probe metadata. The
+                # legacy upload_id column keeps the first upload for backward
+                # compatibility with jobs created by older app versions.
+                columns = {row[1] for row in connection.execute("PRAGMA table_info(jobs)").fetchall()}
+                if "upload_ids_json" not in columns:
+                    connection.execute("ALTER TABLE jobs ADD COLUMN upload_ids_json TEXT")
+                if "files_metadata_json" not in columns:
+                    connection.execute("ALTER TABLE jobs ADD COLUMN files_metadata_json TEXT")
+                connection.execute("PRAGMA user_version = 2")
 
     @staticmethod
     def _decode(row: sqlite3.Row | None) -> dict[str, Any] | None:
         if row is None:
             return None
         data = dict(row)
-        for key in ("metadata_json", "options_json", "result_json"):
+        for key in ("metadata_json", "options_json", "result_json", "upload_ids_json", "files_metadata_json"):
             if key in data:
                 value = data.pop(key)
                 data[key.removesuffix("_json")] = json.loads(value) if value else None
@@ -115,14 +128,31 @@ class Database:
         with self._lock, self._connect() as connection:
             connection.execute("DELETE FROM uploads WHERE id = ?", (upload_id,))
 
-    def create_job(self, job_id: str, upload_id: str, options: dict) -> dict:
+    def create_job(
+        self,
+        job_id: str,
+        upload_id: str,
+        options: dict,
+        *,
+        upload_ids: list[str] | None = None,
+        files_metadata: list[dict] | None = None,
+    ) -> dict:
         now = utc_now()
         with self._lock, self._connect() as connection:
             connection.execute(
                 """INSERT INTO jobs
-                (id, upload_id, state, stage, progress, message, options_json, created_at, updated_at)
-                VALUES (?, ?, 'queued', 'queued', 0, '等待开始', ?, ?, ?)""",
-                (job_id, upload_id, json.dumps(options, ensure_ascii=False), now, now),
+                (id, upload_id, state, stage, progress, message, options_json,
+                 upload_ids_json, files_metadata_json, created_at, updated_at)
+                VALUES (?, ?, 'queued', 'queued', 0, '等待开始', ?, ?, ?, ?, ?)""",
+                (
+                    job_id,
+                    upload_id,
+                    json.dumps(options, ensure_ascii=False),
+                    json.dumps(upload_ids, ensure_ascii=False) if upload_ids is not None else None,
+                    json.dumps(files_metadata, ensure_ascii=False) if files_metadata is not None else None,
+                    now,
+                    now,
+                ),
             )
         return self.get_job(job_id) or {}
 
@@ -145,6 +175,8 @@ class Database:
             "progress",
             "message",
             "metadata_json",
+            "upload_ids_json",
+            "files_metadata_json",
             "result_json",
             "error",
         }

@@ -90,6 +90,8 @@ const STATE_LABELS = {
   cancelled: "已取消",
 };
 
+const MAX_JOB_FILES = 8;
+
 async function fetchJson(url, options = {}) {
   const response = await fetch(url, options);
   if (!response.ok) {
@@ -160,6 +162,10 @@ async function uploadInChunks(file, setProgress) {
   return fetchJson(`/api/uploads/${initialized.upload_id}/complete`, { method: "POST" });
 }
 
+function fileKey(file) {
+  return `${file.name}:${file.size}:${file.lastModified}`;
+}
+
 function ToggleGroup({ label, value, options, onChange }) {
   return (
     <div className="field-block">
@@ -193,9 +199,10 @@ function SelectField({ label, value, options, onChange }) {
 
 function App() {
   const fileInput = useRef(null);
-  const [file, setFile] = useState(null);
-  const [localMetadata, setLocalMetadata] = useState(null);
-  const [previewUrl, setPreviewUrl] = useState("");
+  const fileIdRef = useRef(0);
+  const filesRef = useRef([]);
+  const [files, setFiles] = useState([]);
+  const [uploadLabel, setUploadLabel] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [apiHost, setApiHost] = useState(() => window.localStorage.getItem("xunyou_qwen_api_host") || "");
   const [keyStatus, setKeyStatus] = useState("idle");
@@ -226,7 +233,16 @@ function App() {
     }
   }
 
-  useEffect(() => () => previewUrl && URL.revokeObjectURL(previewUrl), [previewUrl]);
+  useEffect(() => {
+    filesRef.current = files;
+  }, [files]);
+
+  useEffect(
+    () => () => {
+      filesRef.current.forEach((item) => URL.revokeObjectURL(item.previewUrl));
+    },
+    [],
+  );
 
   useEffect(() => {
     const value = apiHost.trim();
@@ -289,24 +305,52 @@ function App() {
     return index < 0 ? 0 : index;
   }, [busy, job]);
 
-  function chooseFile(candidate) {
+  function chooseFiles(candidates) {
     setError("");
     setJob(null);
-    if (!candidate) return;
-    const extension = candidate.name.split(".").pop()?.toLowerCase();
-    if (!["mp4", "mov", "mkv"].includes(extension)) {
-      setError("仅支持 MP4、MOV 和 MKV 文件。");
+    const accepted = [];
+    const problems = [];
+    for (const candidate of candidates || []) {
+      if (!candidate) continue;
+      const extension = candidate.name.split(".").pop()?.toLowerCase();
+      if (!["mp4", "mov", "mkv"].includes(extension)) {
+        problems.push(`${candidate.name}：仅支持 MP4、MOV 和 MKV 文件`);
+        continue;
+      }
+      if (candidate.size > 20 * 1024 ** 3) {
+        problems.push(`${candidate.name}：单个文件不能超过20GB`);
+        continue;
+      }
+      accepted.push(candidate);
+    }
+    const existing = new Set(files.map((item) => fileKey(item.file)));
+    const additions = accepted
+      .filter((candidate) => !existing.has(fileKey(candidate)))
+      .map((candidate) => ({
+        id: (fileIdRef.current += 1),
+        file: candidate,
+        previewUrl: URL.createObjectURL(candidate),
+        metadata: null,
+      }));
+    if (!additions.length) {
+      if (problems.length) setError(problems.join("；"));
       return;
     }
-    if (candidate.size > 20 * 1024 ** 3) {
-      setError("单个文件不能超过20GB。");
-      return;
+    let combined = [...files, ...additions];
+    if (combined.length > MAX_JOB_FILES) {
+      combined.slice(MAX_JOB_FILES).forEach((item) => URL.revokeObjectURL(item.previewUrl));
+      combined = combined.slice(0, MAX_JOB_FILES);
+      problems.push(`一次最多支持${MAX_JOB_FILES}个录像文件，已忽略多余的文件。`);
     }
-    if (previewUrl) URL.revokeObjectURL(previewUrl);
-    setFile(candidate);
-    setLocalMetadata(null);
-    setPreviewUrl(URL.createObjectURL(candidate));
+    setFiles(combined);
+    if (problems.length) setError(problems.join("；"));
     setUploadProgress(0);
+  }
+
+  function removeFile(id) {
+    const target = files.find((item) => item.id === id);
+    if (target) URL.revokeObjectURL(target.previewUrl);
+    setFiles((current) => current.filter((item) => item.id !== id));
   }
 
   function toggleHighlight(key) {
@@ -341,7 +385,7 @@ function App() {
   }
 
   async function startEditing() {
-    if (!file || busy) return;
+    if (!files.length || busy) return;
     if (!highlightTypes.length) {
       setError("请至少选择一种高光类型。");
       return;
@@ -355,14 +399,30 @@ function App() {
     setError("");
     setJob(null);
     setUploadProgress(0);
+    const totalBytes = files.reduce((sum, item) => sum + item.file.size, 0) || 1;
+    const uploadIds = [];
     try {
-      const upload = await uploadInChunks(file, setUploadProgress);
-      if (upload.metadata) setLocalMetadata(upload.metadata);
+      let sentBytes = 0;
+      for (let index = 0; index < files.length; index += 1) {
+        const item = files[index];
+        setUploadLabel(`正在上传 ${index + 1}/${files.length}：${item.file.name}`);
+        const upload = await uploadInChunks(item.file, (fraction) => {
+          setUploadProgress((sentBytes + fraction * item.file.size) / totalBytes);
+        });
+        sentBytes += item.file.size;
+        uploadIds.push(upload.upload_id);
+        if (upload.metadata) {
+          setFiles((current) =>
+            current.map((entry) => (entry.id === item.id ? { ...entry, metadata: upload.metadata } : entry)),
+          );
+        }
+      }
+      setUploadLabel("");
       const created = await fetchJson("/api/jobs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          upload_id: upload.upload_id,
+          upload_ids: uploadIds,
           options: {
             game,
             game_mode: gameMode,
@@ -377,6 +437,7 @@ function App() {
       setJob(created);
     } catch (startError) {
       setError(startError.message);
+      setUploadLabel("");
       setBusy(false);
     }
   }
@@ -405,14 +466,13 @@ function App() {
     if (job?.job_id && ["completed", "failed", "cancelled"].includes(job.state)) {
       await fetchJson(`/api/jobs/${job.job_id}`, { method: "DELETE" }).catch(() => null);
     }
-    if (previewUrl) URL.revokeObjectURL(previewUrl);
-    setFile(null);
-    setLocalMetadata(null);
-    setPreviewUrl("");
+    files.forEach((item) => URL.revokeObjectURL(item.previewUrl));
+    setFiles([]);
     setJob(null);
     setError("");
     setBusy(false);
     setUploadProgress(0);
+    setUploadLabel("");
     setKeyStatus("idle");
     if (fileInput.current) fileInput.current.value = "";
     await refreshHistory();
@@ -488,35 +548,51 @@ function App() {
 
         <div className="workspace-grid">
           <section className="panel upload-panel">
-            <div className="section-heading"><span>01</span><div><h2>选择游戏录像</h2><p>支持 MP4 / MOV / MKV · 最高1080P · 最长2小时</p></div></div>
-            {!file ? (
+            <div className="section-heading"><span>01</span><div><h2>选择游戏录像</h2><p>支持 MP4 / MOV / MKV · 最高1080P · 单个最长2小时 · 最多{MAX_JOB_FILES}个文件</p></div></div>
+            <input
+              ref={fileInput}
+              type="file"
+              multiple
+              accept=".mp4,.mov,.mkv,video/mp4,video/quicktime"
+              onChange={(event) => {
+                chooseFiles(event.target.files);
+                event.target.value = "";
+              }}
+              hidden
+            />
+            {files.length === 0 ? (
               <div
                 className={`dropzone ${dragging ? "dragging" : ""}`}
                 onDragOver={(event) => { event.preventDefault(); setDragging(true); }}
                 onDragLeave={() => setDragging(false)}
-                onDrop={(event) => { event.preventDefault(); setDragging(false); chooseFile(event.dataTransfer.files[0]); }}
+                onDrop={(event) => { event.preventDefault(); setDragging(false); chooseFiles(event.dataTransfer.files); }}
                 onClick={() => fileInput.current?.click()}
                 role="button"
                 tabIndex={0}
                 data-testid="upload-dropzone"
               >
-                <input
-                  ref={fileInput}
-                  type="file"
-                  accept=".mp4,.mov,.mkv,video/mp4,video/quicktime"
-                  onChange={(event) => chooseFile(event.target.files?.[0])}
-                  hidden
-                />
                 <div className="upload-icon">↥</div>
-                <strong>拖入录像，或点击选择文件</strong>
-                <span>单文件上限 20GB，采用分块上传</span>
+                <strong>拖入一个或多个录像，或点击选择</strong>
+                <span>多段录像会合成一条高光 · 单文件上限 20GB · 分块上传</span>
               </div>
             ) : (
-              <div className="video-card">
-                <video src={previewUrl} controls preload="metadata" />
-                <div className="file-row">
-                  <div><strong>{file.name}</strong><span>{formatBytes(file.size)}{localMetadata ? ` · ${localMetadata.width}×${localMetadata.height} · ${formatDuration(localMetadata.duration)}` : " · 上传后显示分辨率与时长"}</span></div>
-                  {!busy && <button type="button" className="text-button" onClick={resetAll}>更换</button>}
+              <div className="file-list">
+                {files.map((item) => (
+                  <div className="file-item" key={item.id}>
+                    <video src={item.previewUrl} muted preload="metadata" />
+                    <div className="file-info">
+                      <strong>{item.file.name}</strong>
+                      <span>{formatBytes(item.file.size)}{item.metadata ? ` · ${item.metadata.width}×${item.metadata.height} · ${formatDuration(item.metadata.duration)}` : " · 上传后显示分辨率与时长"}</span>
+                    </div>
+                    {!busy && <button type="button" className="text-button" onClick={() => removeFile(item.id)}>移除</button>}
+                  </div>
+                ))}
+                <div className="file-list-footer">
+                  {!busy && files.length < MAX_JOB_FILES && (
+                    <button type="button" className="text-button" onClick={() => fileInput.current?.click()}>+ 继续添加</button>
+                  )}
+                  {!busy && <button type="button" className="text-button" onClick={resetAll}>清空重选</button>}
+                  {files.length > 1 && <small>{files.length} 个文件 · 共 {formatBytes(files.reduce((sum, item) => sum + item.file.size, 0))}</small>}
                 </div>
               </div>
             )}
@@ -585,7 +661,7 @@ function App() {
             <button
               type="button"
               className="primary-button"
-              disabled={!file || busy || !highlightTypes.length || !qwenConfigured || qwenStatusLoading}
+              disabled={!files.length || busy || !highlightTypes.length || !qwenConfigured || qwenStatusLoading}
               onClick={startEditing}
               data-testid="start-button"
             >
@@ -596,7 +672,7 @@ function App() {
 
         {(busy || job) && (
           <section className="panel progress-panel" data-testid="progress-panel">
-            <div className="progress-header"><div><span className="pulse" /><strong>{job?.message || `正在快速写入本机：${Math.round(uploadProgress * 100)}%`}</strong></div><div className="progress-actions">{job && ["queued", "running"].includes(job.state) && <button type="button" className="cancel-button" onClick={() => cancelJob(job.job_id)}>取消任务</button>}<b>{Math.min(100, Math.round(displayProgress * 100))}%</b></div></div>
+            <div className="progress-header"><div><span className="pulse" /><strong>{job?.message || uploadLabel || `正在快速写入本机：${Math.round(uploadProgress * 100)}%`}</strong></div><div className="progress-actions">{job && ["queued", "running"].includes(job.state) && <button type="button" className="cancel-button" onClick={() => cancelJob(job.job_id)}>取消任务</button>}<b>{Math.min(100, Math.round(displayProgress * 100))}%</b></div></div>
             <div className="progress-track"><i style={{ width: `${Math.max(2, displayProgress * 100)}%` }} /></div>
             <div className="stage-row">
               {STAGES.map(([key, label], index) => <div key={key} className={index <= currentStageIndex ? "reached" : ""}><span>{index < currentStageIndex || job?.state === "completed" ? "✓" : index + 1}</span><small>{label}</small></div>)}
@@ -608,7 +684,7 @@ function App() {
 
         {result && (
           <section className="result-section" data-testid="result-section">
-            <div className="result-copy"><span className="success-label">剪辑完成</span><h2>{result.title}</h2><p>{result.reason}</p><div className="result-tags"><span>{result.category_label || HIGHLIGHT_LABELS[result.category] || result.category}</span><span>{result.detected_game || GAME_LABELS[result.game] || "FPS游戏"}</span>{RAINBOW_SIX_EVENT_LABELS[result.rainbow_six?.event_type] && <span>{RAINBOW_SIX_EVENT_LABELS[result.rainbow_six.event_type]}</span>}{!["none", "unknown", undefined].includes(result.rainbow_six?.clutch_situation) && <span>{result.rainbow_six.clutch_situation} 残局</span>}<span>{Math.round(result.duration)}秒</span>{result.segment_count > 1 && <span>{result.segment_count}段高光</span>}{result.transition_count > 0 && <span>斜纹转场</span>}<span>千问精选</span>{result.subtitles?.burned && <span>已烧录字幕</span>}{result.subtitles?.mode === "smart" && !result.subtitles?.burned && <span>智能跳过字幕</span>}</div></div>
+            <div className="result-copy"><span className="success-label">剪辑完成</span><h2>{result.title}</h2><p>{result.reason}</p><div className="result-tags"><span>{result.category_label || HIGHLIGHT_LABELS[result.category] || result.category}</span><span>{result.detected_game || GAME_LABELS[result.game] || "FPS游戏"}</span>{RAINBOW_SIX_EVENT_LABELS[result.rainbow_six?.event_type] && <span>{RAINBOW_SIX_EVENT_LABELS[result.rainbow_six.event_type]}</span>}{!["none", "unknown", undefined].includes(result.rainbow_six?.clutch_situation) && <span>{result.rainbow_six.clutch_situation} 残局</span>}<span>{Math.round(result.duration)}秒</span>{result.segment_count > 1 && <span>{result.segment_count}段高光</span>}{result.file_count > 1 && <span>{result.file_count}个录像合成</span>}{result.transition_count > 0 && <span>斜纹转场</span>}<span>千问精选</span>{result.subtitles?.burned && <span>已烧录字幕</span>}{result.subtitles?.mode === "smart" && !result.subtitles?.burned && <span>智能跳过字幕</span>}</div></div>
             <div className="result-video"><video src={result.video_url} controls preload="metadata" /><div className="result-actions"><a className="download-button" href={result.download_url}>下载 MP4</a><button type="button" onClick={resetAll}>清理并处理新视频</button></div><small>同时保存在：{result.output_path}</small></div>
           </section>
         )}

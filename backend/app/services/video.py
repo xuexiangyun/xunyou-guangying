@@ -461,7 +461,17 @@ def render_clip(
     start: float,
     duration: float,
     token: CancellationToken | None = None,
+    *,
+    inject_silence: bool = False,
+    normalize: tuple[int, int, float] | None = None,
 ) -> None:
+    """Cut one clip from ``source``.
+
+    ``inject_silence`` adds a silent stereo track for sources without audio so
+    the clip stays concat-compatible with clips that do have audio. ``normalize``
+    (target_width, target_height, target_fps) re-encodes the clip to a uniform
+    format when multiple recordings feed the same montage.
+    """
     output.parent.mkdir(parents=True, exist_ok=True)
     command = [
         settings.ffmpeg,
@@ -474,26 +484,44 @@ def render_clip(
         f"{duration:.3f}",
         "-i",
         str(source),
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a?",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "20",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-movflags",
-        "+faststart",
-        str(output),
     ]
+    if inject_silence:
+        command.extend(["-f", "lavfi", "-t", f"{duration:.3f}", "-i", "anullsrc=r=48000:cl=stereo"])
+    command.extend(["-map", "0:v:0", "-map", "1:a" if inject_silence else "0:a?"])
+    if normalize:
+        target_width, target_height, target_fps = normalize
+        command.extend(
+            [
+                "-vf",
+                ",".join(
+                    [
+                        f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease",
+                        f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:color=black",
+                        "setsar=1",
+                        f"fps={target_fps:.3f}",
+                    ]
+                ),
+            ]
+        )
+    command.extend(
+        [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+        ]
+    )
+    if normalize or inject_silence:
+        command.extend(["-ar", "48000", "-ac", "2"])
+    command.extend(["-movflags", "+faststart", str(output)])
     run_command(command, capture=False, token=token)
 
 
@@ -512,19 +540,42 @@ def _diagonal_stripe_expression(direction: str) -> str:
 
 
 def render_montage(
-    source: Path,
     output: Path,
-    segments: list[dict[str, float]],
+    segments: list[dict],
     transition_duration: float = 0.0,
     token: CancellationToken | None = None,
+    sources_info: dict[str, dict] | None = None,
 ) -> dict[str, float | int | str]:
+    """Render one highlight reel from per-segment sources.
+
+    Each segment must carry its own ``source`` path (segments may come from
+    different recordings). ``sources_info`` maps each source path to its probe
+    metadata (width/height/fps/has_audio); when segments span multiple sources
+    every input is normalized to the smallest shared resolution and frame rate
+    so xfade/acrossfade keep working.
+    """
     if not segments:
         raise ValueError("至少需要一个高光片段。")
     output.parent.mkdir(parents=True, exist_ok=True)
+
+    def info_for(source: str) -> dict:
+        return (sources_info or {}).get(source) or {
+            "width": 1920,
+            "height": 1080,
+            "fps": 30.0,
+            "has_audio": True,
+        }
+
     segment_durations = [float(segment["duration"]) for segment in segments]
     if len(segments) == 1:
         segment = segments[0]
-        render_clip(source, output, float(segment["start"]), float(segment["duration"]), token=token)
+        render_clip(
+            Path(segment["source"]),
+            output,
+            float(segment["start"]),
+            float(segment["duration"]),
+            token=token,
+        )
         duration = float(probe_video(output)["duration"])
         return {
             "duration": duration,
@@ -533,6 +584,18 @@ def render_montage(
             "transition_style": "none",
         }
 
+    used_sources = {str(segment["source"]) for segment in segments}
+    infos = {source: info_for(source) for source in used_sources}
+    multi_source = len(used_sources) > 1
+    has_audio_any = any(bool(info["has_audio"]) for info in infos.values())
+    normalize: tuple[int, int, float] | None = None
+    if multi_source:
+        target_width = min(int(info["width"]) for info in infos.values())
+        target_height = min(int(info["height"]) for info in infos.values())
+        fps_values = [float(info.get("fps") or 0) for info in infos.values()]
+        target_fps = min(value for value in fps_values if value > 0) if any(value > 0 for value in fps_values) else 30.0
+        normalize = (target_width, target_height, target_fps)
+
     requested_transition = max(0.0, float(transition_duration))
     effective_transition = min(requested_transition, min(segment_durations) * 0.45)
 
@@ -540,8 +603,9 @@ def render_montage(
         # Seek each source input directly and encode the finished timeline once.
         # The previous implementation encoded every part and then encoded the
         # montage again, which doubled the slowest part of the render stage.
-        source_metadata = probe_video(source)
         command = [settings.ffmpeg, "-y", "-v", "error"]
+        segment_video_inputs: list[int] = []
+        next_input = 0
         for segment in segments:
             command.extend(
                 [
@@ -550,13 +614,45 @@ def render_montage(
                     "-t",
                     f"{float(segment['duration']):.3f}",
                     "-i",
-                    str(source),
+                    str(segment["source"]),
                 ]
             )
+            segment_video_inputs.append(next_input)
+            next_input += 1
+
+        # Stand-in silent inputs keep the acrossfade chain valid when some
+        # recordings have an audio track and others do not.
+        segment_audio_inputs: list[int | None] = []
+        if has_audio_any:
+            for segment in segments:
+                if bool(infos[str(segment["source"])]["has_audio"]):
+                    segment_audio_inputs.append(None)
+                else:
+                    command.extend(
+                        [
+                            "-f",
+                            "lavfi",
+                            "-t",
+                            f"{float(segment['duration']):.3f}",
+                            "-i",
+                            "anullsrc=r=48000:cl=stereo",
+                        ]
+                    )
+                    segment_audio_inputs.append(next_input)
+                    next_input += 1
 
         filters: list[str] = []
         for index in range(len(segments)):
-            filters.append(f"[{index}:v]settb=AVTB,setpts=PTS-STARTPTS,format=yuv420p[v{index}]")
+            video_input = segment_video_inputs[index]
+            if multi_source:
+                filters.append(
+                    f"[{video_input}:v]settb=AVTB,setpts=PTS-STARTPTS,"
+                    f"scale={normalize[0]}:{normalize[1]}:force_original_aspect_ratio=decrease,"
+                    f"pad={normalize[0]}:{normalize[1]}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                    f"setsar=1,fps={normalize[2]:.3f},format=yuv420p[v{index}]"
+                )
+            else:
+                filters.append(f"[{video_input}:v]settb=AVTB,setpts=PTS-STARTPTS,format=yuv420p[v{index}]")
 
         video_label = "v0"
         timeline_duration = segment_durations[0]
@@ -573,11 +669,21 @@ def render_montage(
             video_label = output_label
             timeline_duration += segment_durations[index] - effective_transition
 
-        has_audio = bool(source_metadata["has_audio"])
         audio_label = ""
-        if has_audio:
+        if has_audio_any:
             for index in range(len(segments)):
-                filters.append(f"[{index}:a]asetpts=PTS-STARTPTS[a{index}]")
+                silent_input = segment_audio_inputs[index]
+                if silent_input is None:
+                    audio_input = segment_video_inputs[index]
+                    if multi_source:
+                        filters.append(
+                            f"[{audio_input}:a]aresample=48000,"
+                            f"aformat=channel_layouts=stereo,asetpts=PTS-STARTPTS[a{index}]"
+                        )
+                    else:
+                        filters.append(f"[{audio_input}:a]asetpts=PTS-STARTPTS[a{index}]")
+                else:
+                    filters.append(f"[{silent_input}:a]asetpts=PTS-STARTPTS[a{index}]")
             audio_label = "a0"
             for index in range(1, len(segments)):
                 output_label = f"ax{index}"
@@ -588,7 +694,7 @@ def render_montage(
                 audio_label = output_label
 
         command.extend(["-filter_complex", ";".join(filters), "-map", f"[{video_label}]"])
-        if has_audio:
+        if has_audio_any:
             command.extend(["-map", f"[{audio_label}]"])
         command.extend(
             [
@@ -602,7 +708,7 @@ def render_montage(
                 "yuv420p",
             ]
         )
-        if has_audio:
+        if has_audio_any:
             command.extend(["-c:a", "aac", "-b:a", "192k"])
         command.extend(["-shortest", "-movflags", "+faststart", str(output)])
         run_command(command, capture=False, token=token)
@@ -618,7 +724,15 @@ def render_montage(
     part_paths: list[Path] = []
     for index, segment in enumerate(segments):
         part_path = parts_dir / f"part_{index:03d}.mp4"
-        render_clip(source, part_path, float(segment["start"]), float(segment["duration"]), token=token)
+        render_clip(
+            Path(segment["source"]),
+            part_path,
+            float(segment["start"]),
+            float(segment["duration"]),
+            token=token,
+            inject_silence=has_audio_any and not bool(infos[str(segment["source"])]["has_audio"]),
+            normalize=normalize,
+        )
         part_paths.append(part_path)
 
     concat_file = parts_dir / "concat.txt"

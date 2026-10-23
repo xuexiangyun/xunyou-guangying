@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -21,9 +22,11 @@ from backend.app.services.qwen import (
     qwen_error_message,
     save_credentials,
 )
-from backend.app.schemas import JobOptions
+from backend.app.schemas import JobCreateRequest, JobOptions
 from backend.app.services.subtitles import create_caption_images
 from backend.app.services.pipeline import (
+    SourceVideo,
+    _apply_analysis_budget,
     _build_montage_plan,
     _candidate_bounds,
     _qualified_candidates,
@@ -685,8 +688,7 @@ def test_local_pipeline_with_synthetic_video(tmp_path: Path, monkeypatch: pytest
     pipeline.run_pipeline(
         database=database,
         job_id="job",
-        source=source,
-        metadata=metadata,
+        sources=[SourceVideo(path=source, metadata=metadata)],
         options=options,
         qwen_api_key="",
         qwen_api_host="",
@@ -704,21 +706,282 @@ def test_local_pipeline_with_synthetic_video(tmp_path: Path, monkeypatch: pytest
 
     montage = tmp_path / "two-part-montage.mp4"
     render_montage(
-        source,
         montage,
-        [{"start": 0.0, "duration": 4.0}, {"start": 10.0, "duration": 4.0}],
+        [
+            {"start": 0.0, "duration": 4.0, "source": str(source)},
+            {"start": 10.0, "duration": 4.0, "source": str(source)},
+        ],
     )
     montage_metadata = probe_video(montage)
     assert montage_metadata["duration"] == pytest.approx(8.0, abs=0.2)
 
     transitioned_montage = tmp_path / "two-part-transitioned-montage.mp4"
     transition_result = render_montage(
-        source,
         transitioned_montage,
-        [{"start": 0.0, "duration": 4.0}, {"start": 10.0, "duration": 4.0}],
+        [
+            {"start": 0.0, "duration": 4.0, "source": str(source)},
+            {"start": 10.0, "duration": 4.0, "source": str(source)},
+        ],
         transition_duration=1.5,
     )
     transitioned_metadata = probe_video(transitioned_montage)
     assert transitioned_metadata["duration"] == pytest.approx(6.5, abs=0.25)
     assert transition_result["transition_count"] == 1
     assert transition_result["transition_style"] == "diagonal_stripes"
+
+
+def test_job_create_request_resolves_upload_ids_with_legacy_support() -> None:
+    legacy = JobCreateRequest(upload_id="u1")
+    assert legacy.resolved_upload_ids() == ["u1"]
+
+    normalized = JobCreateRequest(upload_ids=[" u1 ", "u2", "u1", " ", "u2"])
+    assert normalized.resolved_upload_ids() == ["u1", "u2"]
+
+    both = JobCreateRequest(upload_id="legacy", upload_ids=["u1", "u2"])
+    assert both.resolved_upload_ids() == ["u1", "u2"]
+
+    with pytest.raises(ValueError):
+        JobCreateRequest().resolved_upload_ids()
+
+    with pytest.raises(ValueError):
+        JobCreateRequest(upload_ids=[f"u{index}" for index in range(9)]).resolved_upload_ids()
+
+
+def test_analysis_budget_keeps_every_file_represented() -> None:
+    candidates = [{"file_index": 0, "rank": rank} for rank in range(10)] + [
+        {"file_index": 1, "rank": rank} for rank in range(3)
+    ]
+    trimmed = _apply_analysis_budget(candidates, 8)
+    assert len(trimmed) == 8
+    # The shorter recording keeps all of its candidates instead of being
+    # crowded out by the longer one.
+    assert sum(1 for item in trimmed if item["file_index"] == 1) == 3
+    assert sum(1 for item in trimmed if item["file_index"] == 0) == 5
+    assert _apply_analysis_budget(candidates, 20) == candidates
+
+
+def test_montage_plan_dedups_events_per_file_and_orders_by_file() -> None:
+    def candidate(score: float, file_index: int, path: str, event_time: float) -> dict:
+        return {
+            "score": score,
+            "category": "skill",
+            "title": f"片段{file_index}",
+            "confidence": 0.8,
+            "reason": "本地测试候选",
+            "provider": "local",
+            "file_index": file_index,
+            "source": path,
+            "filename": Path(path).name,
+            "context_start": 0.0,
+            "context_duration": 30.0,
+            "event_time": event_time,
+            "clip_start": 10.0,
+            "clip_end": 22.0,
+            "death_safe_trimmed": True,
+        }
+
+    analyzed = [
+        candidate(90, 1, "/tmp/round-2.mp4", 15.0),
+        candidate(80, 0, "/tmp/round-1.mp4", 15.0),
+        # Same file as the 80-score event and nearly overlapping: deduped.
+        candidate(70, 0, "/tmp/round-1.mp4", 16.0),
+    ]
+    plan = _build_montage_plan(analyzed, 60.0, [600.0, 600.0], 0.0)
+    assert len(plan) == 2
+    assert [segment["file_index"] for segment in plan] == [0, 1]
+    assert plan[0]["source"] == "/tmp/round-1.mp4"
+    assert plan[0]["filename"] == "round-1.mp4"
+    assert plan[1]["source"] == "/tmp/round-2.mp4"
+    assert plan[1]["filename"] == "round-2.mp4"
+
+
+def test_database_stores_multi_file_jobs_and_migrates_legacy_schema(tmp_path: Path) -> None:
+    legacy_path = tmp_path / "legacy.sqlite3"
+    connection = sqlite3.connect(legacy_path)
+    connection.executescript(
+        """
+        CREATE TABLE uploads (
+            id TEXT PRIMARY KEY,
+            filename TEXT NOT NULL,
+            stored_path TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            received_bytes INTEGER NOT NULL DEFAULT 0,
+            content_type TEXT NOT NULL,
+            state TEXT NOT NULL,
+            metadata_json TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE jobs (
+            id TEXT PRIMARY KEY,
+            upload_id TEXT NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
+            state TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            progress REAL NOT NULL DEFAULT 0,
+            message TEXT NOT NULL,
+            options_json TEXT NOT NULL,
+            metadata_json TEXT,
+            result_json TEXT,
+            error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        PRAGMA user_version = 1;
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    database = Database(legacy_path)
+    with sqlite3.connect(legacy_path) as migrated:
+        columns = {row[1] for row in migrated.execute("PRAGMA table_info(jobs)").fetchall()}
+        assert "upload_ids_json" in columns
+        assert "files_metadata_json" in columns
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 2
+    migrated.close()
+
+    metadata_by_upload = {
+        "u1": {"width": 1280, "duration": 60.0},
+        "u2": {"width": 960, "duration": 45.0},
+    }
+    for upload_id, metadata in metadata_by_upload.items():
+        path = tmp_path / f"{upload_id}.mp4"
+        path.write_bytes(b"placeholder")
+        database.create_upload(upload_id, path.name, path, path.stat().st_size, "video/mp4")
+        database.update_upload(
+            upload_id,
+            state="ready",
+            received_bytes=path.stat().st_size,
+            metadata_json=metadata,
+        )
+
+    database.create_job(
+        "job",
+        "u1",
+        {"game": "auto", "sensitivity": "balanced"},
+        upload_ids=["u1", "u2"],
+        files_metadata=[metadata_by_upload["u1"], metadata_by_upload["u2"]],
+    )
+    job = database.get_job("job")
+    assert job is not None
+    assert job["upload_id"] == "u1"
+    assert job["upload_ids"] == ["u1", "u2"]
+    assert job["files_metadata"] == [metadata_by_upload["u1"], metadata_by_upload["u2"]]
+
+    database.update_job("job", upload_ids_json=["u1"], files_metadata_json=[metadata_by_upload["u1"]])
+    updated = database.get_job("job")
+    assert updated is not None
+    assert updated["upload_ids"] == ["u1"]
+    assert updated["files_metadata"] == [metadata_by_upload["u1"]]
+
+
+@pytest.mark.integration
+def test_multi_file_pipeline_produces_cross_file_montage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = tmp_path / "match-1.mp4"
+    subprocess.run(
+        [
+            settings.ffmpeg,
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=1280x720:rate=30:duration=20",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=20",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(first),
+        ],
+        check=True,
+    )
+    second = tmp_path / "match-2.mp4"
+    subprocess.run(
+        [
+            settings.ffmpeg,
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=960x540:rate=24:duration=20",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            str(second),
+        ],
+        check=True,
+    )
+
+    database = Database(tmp_path / "multi.sqlite3")
+    sources: list[pipeline.SourceVideo] = []
+    for index, path in enumerate((first, second), start=1):
+        metadata = probe_video(path)
+        upload_id = f"upload-{index}"
+        database.create_upload(upload_id, path.name, path, path.stat().st_size, "video/mp4")
+        database.update_upload(
+            upload_id,
+            state="ready",
+            received_bytes=path.stat().st_size,
+            metadata_json=metadata,
+        )
+        sources.append(pipeline.SourceVideo(path=path, metadata=metadata, filename=path.name))
+
+    options = {
+        "game": "auto",
+        "game_mode": "auto",
+        "highlight_types": ["kill", "clutch", "skill"],
+        "duration_mode": "seconds_30",
+        "subtitles": False,
+        "subtitle_style": "gaming",
+        "sensitivity": "balanced",
+    }
+    database.create_job(
+        "job",
+        "upload-1",
+        options,
+        upload_ids=["upload-1", "upload-2"],
+        files_metadata=[sources[0].metadata, sources[1].metadata],
+    )
+    monkeypatch.setattr(pipeline, "TEMP_DIR", tmp_path / "temp")
+    monkeypatch.setattr(pipeline, "OUTPUT_DIR", tmp_path / "output")
+    pipeline.run_pipeline(
+        database=database,
+        job_id="job",
+        sources=sources,
+        options=options,
+        qwen_api_key="",
+        qwen_api_host="",
+    )
+
+    job = database.get_job("job")
+    assert job and job["state"] == "completed", job.get("error") if job else None
+    result = job["result"]
+    assert result["file_count"] == 2
+    assert [item["filename"] for item in result["files"]] == ["match-1.mp4", "match-2.mp4"]
+    assert {segment["source"] for segment in result["segments"]} == {str(first), str(second)}
+
+    output = Path(result["output_path"])
+    assert output.exists()
+    output_metadata = probe_video(output)
+    # Normalized to the smallest shared resolution, and the audio-less source
+    # received an injected silent track.
+    assert output_metadata["width"] == 960
+    assert output_metadata["height"] == 540
+    assert output_metadata["has_audio"] is True

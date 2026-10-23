@@ -4,6 +4,7 @@ import logging
 import math
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -31,6 +32,19 @@ SMART_SUBTITLE_CATEGORIES = {
     "rescue",
     "boss",
 }
+
+
+@dataclass
+class SourceVideo:
+    """One uploaded recording that feeds a job's shared highlight pool."""
+
+    path: Path
+    metadata: dict
+    filename: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.filename:
+            self.filename = self.path.name
 
 
 class PipelineError(RuntimeError):
@@ -145,10 +159,49 @@ def _candidate_bounds(item: dict, source_duration: float) -> tuple[float, float,
     return round(start, 3), round(duration, 3), round(event_absolute, 3)
 
 
+def _file_duration(item: dict, file_durations: list[float] | float) -> float:
+    """Resolve an item's source duration; a float means one shared timeline."""
+    if isinstance(file_durations, (int, float)):
+        return float(file_durations)
+    index = int(item.get("file_index", 0))
+    if 0 <= index < len(file_durations):
+        return float(file_durations[index])
+    return float(file_durations[0]) if file_durations else 0.0
+
+
+def _apply_analysis_budget(candidates: list[dict], budget: int) -> list[dict]:
+    """Trim candidates to the Qwen analysis budget, fairly across files.
+
+    Candidates arrive ranked per file (rank_local_candidates sorts by local
+    score). Round-robin keeps every recording represented instead of letting
+    one long file consume the whole budget.
+    """
+    if len(candidates) <= budget:
+        return candidates
+    by_file: dict[int, list[dict]] = {}
+    for candidate in candidates:
+        by_file.setdefault(int(candidate.get("file_index", 0)), []).append(candidate)
+    selected: list[dict] = []
+    depth = 0
+    while len(selected) < budget:
+        added = False
+        for file_index in sorted(by_file):
+            queue = by_file[file_index]
+            if depth < len(queue):
+                selected.append(queue[depth])
+                added = True
+                if len(selected) >= budget:
+                    break
+        if not added:
+            break
+        depth += 1
+    return selected
+
+
 def _build_montage_plan(
     analyzed: list[dict],
     target_duration: float,
-    source_duration: float,
+    file_durations: list[float] | float,
     transition_duration: float = 0.0,
 ) -> list[dict]:
     if not analyzed:
@@ -159,12 +212,15 @@ def _build_montage_plan(
     transition = max(0.0, float(transition_duration))
 
     for item in ranked:
-        start, duration, event_absolute = _candidate_bounds(item, source_duration)
+        start, duration, event_absolute = _candidate_bounds(item, _file_duration(item, file_durations))
         if duration <= 0:
             continue
+        # Events only compete for dedup within the same file: two recordings
+        # may each legitimately contain their own near-identical moment.
         if any(
-            abs(event_absolute - existing_event) < max(10.0, min(20.0, (duration + existing_duration) * 0.55))
-            for _, _, existing_duration, existing_event in selected
+            int(item.get("file_index", 0)) == int(other.get("file_index", 0))
+            and abs(event_absolute - existing_event) < max(10.0, min(20.0, (duration + existing_duration) * 0.55))
+            for other, _, existing_duration, existing_event in selected
         ):
             continue
         projected = duration if not selected else timeline_duration + duration - min(transition, duration * 0.45)
@@ -175,7 +231,7 @@ def _build_montage_plan(
 
     if not selected:
         item = ranked[0]
-        start, duration, event_absolute = _candidate_bounds(item, source_duration)
+        start, duration, event_absolute = _candidate_bounds(item, _file_duration(item, file_durations))
         selected = [(item, start, min(duration, target_duration), event_absolute)]
 
     plan: list[dict] = []
@@ -183,6 +239,9 @@ def _build_montage_plan(
         segment = {
             "start": round(start, 3),
             "duration": round(duration, 3),
+            "file_index": int(item.get("file_index", 0)),
+            "filename": str(item.get("filename", "")),
+            "source": str(item.get("source", "")),
             "score": float(item["score"]),
             "title": str(item["title"]),
             "category": str(item["category"]),
@@ -204,15 +263,14 @@ def _build_montage_plan(
         if isinstance(item.get("rainbow_six"), dict):
             segment["rainbow_six"] = dict(item["rainbow_six"])
         plan.append(segment)
-    return sorted(plan, key=lambda item: float(item["start"]))
+    return sorted(plan, key=lambda item: (int(item.get("file_index", 0)), float(item["start"])))
 
 
 def run_pipeline(
     *,
     database: Database,
     job_id: str,
-    source: Path,
-    metadata: dict,
+    sources: list[SourceVideo],
     options: dict,
     qwen_api_key: str,
     qwen_api_host: str,
@@ -222,6 +280,10 @@ def run_pipeline(
     output_dir = OUTPUT_DIR / job_id
     work_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
+    file_count = len(sources)
+    multi_file = file_count > 1
+    file_durations = [float(item.metadata["duration"]) for item in sources]
+    total_duration = sum(file_durations)
 
     def update(stage: str, progress: float, message: str) -> None:
         if cancel_token is not None:
@@ -237,23 +299,48 @@ def run_pipeline(
     try:
         update("local_analysis", 0.05, "正在本地扫描声音和画面")
 
-        def local_progress(value: float, message: str) -> None:
-            update("local_analysis", 0.05 + value * 0.28, message)
+        candidates: list[dict] = []
+        for file_index, item in enumerate(sources):
+            file_span = 0.28 / file_count
+            file_base = 0.05 + file_index * file_span
 
-        candidates = rank_local_candidates(
-            source,
-            float(metadata["duration"]),
-            str(options["sensitivity"]),
-            local_progress,
-            cancel_token,
-        )
-        target_duration = _target_duration(str(options["duration_mode"]), float(metadata["duration"]))
+            def local_progress(
+                value: float,
+                message: str,
+                *,
+                base: float = file_base,
+                span: float = file_span,
+                filename: str = item.filename,
+            ) -> None:
+                text = f"{filename}：{message}" if multi_file else message
+                update("local_analysis", base + value * span, text)
+
+            file_candidates = rank_local_candidates(
+                item.path,
+                float(item.metadata["duration"]),
+                str(options["sensitivity"]),
+                local_progress,
+                cancel_token,
+            )
+            candidates.extend(
+                {
+                    **candidate,
+                    "file_index": file_index,
+                    "source": str(item.path),
+                    "filename": item.filename,
+                }
+                for candidate in file_candidates
+            )
+
+        target_duration = _target_duration(str(options["duration_mode"]), total_duration)
         if qwen_api_key:
             desired_segments = max(1, math.ceil(target_duration / 12.0))
             analysis_budget = max(12, desired_segments * 2)
             if str(options.get("sensitivity")) == "broad":
                 analysis_budget += 2
-            candidates = candidates[: min(len(candidates), analysis_budget)]
+            # Extra slots per additional file keep every recording represented.
+            analysis_budget += 2 * (file_count - 1)
+            candidates = _apply_analysis_budget(candidates, analysis_budget)
         update("candidate_video", 0.35, f"找到 {len(candidates)} 个候选高光")
 
         analyzed: list[dict] = []
@@ -263,7 +350,7 @@ def run_pipeline(
             candidate_dir = work_dir / f"candidate_{index:02d}"
             context_start, context_duration = candidate_window(
                 candidate["center"],
-                float(metadata["duration"]),
+                file_durations[int(candidate.get("file_index", 0))],
                 settings.qwen_candidate_seconds,
             )
             result = {
@@ -296,7 +383,7 @@ def run_pipeline(
             def analyze_prepared(index: int) -> dict:
                 candidate_dir, result = prepared[index]
                 proxy_path = render_analysis_proxy(
-                    source,
+                    Path(result["source"]),
                     candidate_dir / "qwen_candidate.mp4",
                     float(result["context_start"]),
                     float(result["context_duration"]),
@@ -390,7 +477,7 @@ def run_pipeline(
         montage_plan = _build_montage_plan(
             qualified,
             target_duration,
-            float(metadata["duration"]),
+            file_durations,
             settings.transition_seconds,
         )
         if not montage_plan:
@@ -400,16 +487,25 @@ def run_pipeline(
         raw_clip = work_dir / "highlight_raw.mp4"
         final_clip = output_dir / "瞬游光影_最佳高光.mp4"
         render_result = render_montage(
-            source,
             raw_clip,
             montage_plan,
             transition_duration=settings.transition_seconds,
             token=cancel_token,
+            sources_info={
+                str(item.path): {
+                    "width": int(item.metadata.get("width") or 1920),
+                    "height": int(item.metadata.get("height") or 1080),
+                    "fps": float(item.metadata.get("fps") or 30.0),
+                    "has_audio": bool(item.metadata.get("has_audio")),
+                }
+                for item in sources
+            },
         )
 
+        has_any_audio = any(bool(item.metadata.get("has_audio")) for item in sources)
         subtitle_mode = _subtitle_mode(options)
         should_subtitle, subtitle_reason = _should_generate_subtitles(
-            options, montage_plan, bool(metadata.get("has_audio"))
+            options, montage_plan, has_any_audio
         )
         subtitle_result = {
             "mode": subtitle_mode,
@@ -435,7 +531,7 @@ def run_pipeline(
                 raw_clip.replace(final_clip)
                 subtitle_result["warning"] = str(exc)
         else:
-            if subtitle_mode == "smart" and bool(metadata.get("has_audio")):
+            if subtitle_mode == "smart" and has_any_audio:
                 update("subtitles", 0.90, "智能字幕判断完成：这条成片无需字幕")
             raw_clip.replace(final_clip)
 
@@ -457,6 +553,11 @@ def run_pipeline(
             "detected_game": best.get("detected_game", "FPS游戏"),
             "detected_mode": best.get("detected_mode", "未知模式"),
             "rainbow_six": best.get("rainbow_six"),
+            "file_count": file_count,
+            "files": [
+                {"filename": item.filename, "duration": round(float(item.metadata["duration"]), 3)}
+                for item in sources
+            ],
             "start": montage_plan[0]["start"],
             "duration": round(float(render_result["duration"]), 3),
             "segment_count": len(montage_plan),

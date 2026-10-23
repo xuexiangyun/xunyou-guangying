@@ -22,6 +22,7 @@ from .schemas import (
     UploadStatus,
 )
 from .services.maintenance import cleanup_storage, repair_stored_paths
+from .services.pipeline import SourceVideo
 from .services.qwen import load_credentials, qwen_error_message, save_credentials, validate_api_key
 from .services.video import VideoValidationError, estimate_cost, probe_video
 from .settings import FRONTEND_DIST, OUTPUT_DIR, TEMP_DIR, UPLOAD_DIR, ensure_directories, settings
@@ -55,19 +56,39 @@ def _upload_status(record: dict) -> UploadStatus:
     )
 
 
+def _job_upload_ids(record: dict) -> list[str]:
+    """Resolve every upload a job depends on; legacy jobs keep their single id."""
+    upload_ids = list(record.get("upload_ids") or [])
+    if not upload_ids and record.get("upload_id"):
+        upload_ids = [record["upload_id"]]
+    return upload_ids
+
+
 def _job_status(record: dict) -> JobStatus:
-    upload = db.get_upload(record["upload_id"])
+    upload_ids = _job_upload_ids(record)
+    uploads = [upload for upload in (db.get_upload(upload_id) for upload_id in upload_ids) if upload]
+    filenames = [upload["filename"] for upload in uploads]
+    files_metadata = list(record.get("files_metadata") or [])
+    if not files_metadata and record.get("metadata"):
+        files_metadata = [record["metadata"]]
+    if len(filenames) > 1:
+        filename = f"{filenames[0]} 等{len(filenames)}个文件"
+    else:
+        filename = filenames[0] if filenames else None
     return JobStatus(
         job_id=record["id"],
         upload_id=record["upload_id"],
+        upload_ids=upload_ids,
         state=record["state"],
         stage=record["stage"],
         progress=record["progress"],
         message=record["message"],
         options=record["options"],
-        filename=upload["filename"] if upload else None,
-        source_size=upload["size"] if upload else None,
-        metadata=record.get("metadata"),
+        filename=filename,
+        filenames=filenames,
+        source_size=sum(upload["size"] for upload in uploads) if uploads else None,
+        files_metadata=files_metadata,
+        metadata=files_metadata[0] if files_metadata else None,
         result=record.get("result"),
         error=record.get("error"),
         created_at=record["created_at"],
@@ -214,11 +235,18 @@ def configure_qwen(payload: QwenCredentialRequest) -> dict:
 
 @app.post("/api/jobs", response_model=JobStatus, status_code=status.HTTP_202_ACCEPTED)
 def create_job(payload: JobCreateRequest) -> JobStatus:
-    upload = db.get_upload(payload.upload_id)
-    if not upload:
-        raise HTTPException(404, "上传文件不存在。")
-    if upload["state"] != "ready" or not upload.get("metadata"):
-        raise HTTPException(409, "请先完成视频上传和校验。")
+    try:
+        upload_ids = payload.resolved_upload_ids()
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    uploads: list[dict] = []
+    for upload_id in upload_ids:
+        upload = db.get_upload(upload_id)
+        if not upload:
+            raise HTTPException(404, "上传文件不存在，请重新选择视频。")
+        if upload["state"] != "ready" or not upload.get("metadata"):
+            raise HTTPException(409, f"文件「{upload['filename']}」还没有完成上传和校验。")
+        uploads.append(upload)
     active = [job for job in db.list_jobs(20) if job["state"] in {"queued", "running"}]
     if active:
         raise HTTPException(409, "当前已有剪辑任务正在运行，请等待它完成。")
@@ -227,12 +255,24 @@ def create_job(payload: JobCreateRequest) -> JobStatus:
 
     job_id = uuid.uuid4().hex
     options = payload.options.model_dump(mode="json")
-    record = db.create_job(job_id, payload.upload_id, options)
-    db.update_job(job_id, metadata_json=upload["metadata"])
+    record = db.create_job(
+        job_id,
+        uploads[0]["id"],
+        options,
+        upload_ids=[upload["id"] for upload in uploads],
+        files_metadata=[upload["metadata"] for upload in uploads],
+    )
+    db.update_job(job_id, metadata_json=uploads[0]["metadata"])
     jobs.submit(
         job_id=job_id,
-        source=Path(upload["stored_path"]),
-        metadata=upload["metadata"],
+        sources=[
+            SourceVideo(
+                path=Path(upload["stored_path"]),
+                metadata=upload["metadata"],
+                filename=upload["filename"],
+            )
+            for upload in uploads
+        ],
         options=options,
         qwen_api_key=qwen_api_key,
         qwen_api_host=qwen_api_host,
@@ -247,9 +287,12 @@ def retry_job(job_id: str) -> JobStatus:
         raise HTTPException(404, "剪辑任务不存在。")
     if record["state"] != "failed":
         raise HTTPException(409, "只有失败的任务可以重试。")
-    upload = db.get_upload(record["upload_id"])
-    if not upload or upload["state"] != "ready" or not upload.get("metadata"):
-        raise HTTPException(409, "原始上传文件已经不存在，请重新选择视频。")
+    uploads: list[dict] = []
+    for upload_id in _job_upload_ids(record):
+        upload = db.get_upload(upload_id)
+        if not upload or upload["state"] != "ready" or not upload.get("metadata"):
+            raise HTTPException(409, "原始上传文件已经不存在，请重新选择视频。")
+        uploads.append(upload)
     active = [job for job in db.list_jobs(20) if job["state"] in {"queued", "running"}]
     if active:
         raise HTTPException(409, "当前已有剪辑任务正在运行，请等待它完成。")
@@ -266,11 +309,19 @@ def retry_job(job_id: str) -> JobStatus:
         message="等待重新开始",
         result_json=None,
         error=None,
+        metadata_json=uploads[0]["metadata"],
+        files_metadata_json=[upload["metadata"] for upload in uploads],
     )
     jobs.submit(
         job_id=job_id,
-        source=Path(upload["stored_path"]),
-        metadata=upload["metadata"],
+        sources=[
+            SourceVideo(
+                path=Path(upload["stored_path"]),
+                metadata=upload["metadata"],
+                filename=upload["filename"],
+            )
+            for upload in uploads
+        ],
         options=record["options"],
         qwen_api_key=qwen_api_key,
         qwen_api_host=qwen_api_host,
@@ -347,13 +398,14 @@ def delete_job(job_id: str, delete_source: bool = True) -> None:
         raise HTTPException(409, "任务运行中，暂时不能删除。")
     shutil.rmtree(OUTPUT_DIR / job_id, ignore_errors=True)
     shutil.rmtree(TEMP_DIR / job_id, ignore_errors=True)
-    upload_id = record["upload_id"]
+    upload_ids = _job_upload_ids(record)
     db.delete_job(job_id)
     if delete_source:
-        upload = db.get_upload(upload_id)
-        if upload:
-            Path(upload["stored_path"]).unlink(missing_ok=True)
-            db.delete_upload(upload_id)
+        for upload_id in upload_ids:
+            upload = db.get_upload(upload_id)
+            if upload:
+                Path(upload["stored_path"]).unlink(missing_ok=True)
+                db.delete_upload(upload_id)
 
 
 if FRONTEND_DIST.exists():

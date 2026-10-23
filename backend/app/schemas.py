@@ -84,6 +84,8 @@ HIGHLIGHT_TYPES = {
     "unexpected",
 }
 
+MAX_JOB_FILES = 8
+
 
 class UploadInitRequest(BaseModel):
     filename: str = Field(min_length=1, max_length=255)
@@ -153,8 +155,25 @@ class JobOptions(BaseModel):
 
 
 class JobCreateRequest(BaseModel):
-    upload_id: str
+    upload_id: str | None = None  # Legacy single-file field kept for older clients.
+    upload_ids: list[str] = Field(default_factory=list)
     options: JobOptions = Field(default_factory=JobOptions)
+
+    @field_validator("upload_ids")
+    @classmethod
+    def normalize_upload_ids(cls, values: list[str]) -> list[str]:
+        normalized = [value.strip() for value in values if value and value.strip()]
+        return list(dict.fromkeys(normalized))
+
+    def resolved_upload_ids(self) -> list[str]:
+        ids = list(self.upload_ids)
+        if not ids and self.upload_id:
+            ids = [self.upload_id]
+        if not ids:
+            raise ValueError("请至少提供一个上传文件。")
+        if len(ids) > MAX_JOB_FILES:
+            raise ValueError(f"一次最多支持{MAX_JOB_FILES}个录像文件。")
+        return ids
 
 
 class QwenCredentialRequest(BaseModel):
@@ -165,13 +184,16 @@ class QwenCredentialRequest(BaseModel):
 class JobStatus(BaseModel):
     job_id: str
     upload_id: str
+    upload_ids: list[str] = Field(default_factory=list)
     state: Literal["queued", "running", "completed", "failed", "cancelled"]
     stage: str
     progress: float
     message: str
     options: JobOptions
     filename: str | None = None
+    filenames: list[str] = Field(default_factory=list)
     source_size: int | None = None
+    files_metadata: list[dict] = Field(default_factory=list)
     metadata: dict | None = None
     result: dict | None = None
     error: str | None = None
